@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# sandbox-run — run code you don't trust, walled off, with nothing but systemd.
+#
+#   sudo sandbox-run setup
+#   sudo sandbox-run [options] [--] <command> [args...]
+#   sudo sandbox-run check
+#   sudo sandbox-run workdir [NAME]       create a work dir and print its path
+#
+# The command runs as the unprivileged user `sandbox`, in a work directory under
+# $SANDBOX_BASE (default /srv/sandbox-run). /home, /root, /mnt, /media and /var/lib
+# are hidden, the rest of the OS is read-only, privilege escalation is blocked,
+# and it gets memory, CPU, process and time limits. Network defaults to
+# localhost only (so a local model server is reachable, the internet is not).
+#
+# Options:
+#   --dir NAME       work directory under $SANDBOX_BASE (default: default)
+#   --net            full network (e.g. dependency installs)
+#   --no-net         no network at all, not even localhost
+#   --hide PATH      also hide PATH (repeatable)
+#   --mem 8G         memory limit          (default 8G)
+#   --cpus N         CPU limit in cores    (default 4)
+#   --time 1h        wall-clock limit      (default 1h)
+#   --env K=V        pass an environment variable (repeatable)
+set -euo pipefail
+
+VERSION=1.0.0
+BASE=${SANDBOX_BASE:-/srv/sandbox-run}
+SBX_USER=${SANDBOX_USER:-sandbox}
+
+die() { echo "sandbox-run: $*" >&2; exit 2; }
+need_root() { [ "$(id -u)" -eq 0 ] || die "run with sudo (systemd needs root to switch users and set up the walls)"; }
+
+cmd_setup() {
+  need_root
+  command -v systemd-run >/dev/null || die "systemd-run not found — sandbox-run needs systemd"
+  if ! id "$SBX_USER" >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin "$SBX_USER"
+    echo "created user $SBX_USER"
+  fi
+  mkdir -p "$BASE"
+  chown root:root "$BASE"; chmod 755 "$BASE"
+  echo "work directories will live under $BASE"
+  echo "next: sudo sandbox-run check"
+}
+
+run_sandboxed() {
+  local dir=default net=local mem=8G cpus=4 time=1h
+  local -a hide=() envs=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir)    dir=$2; shift 2 ;;
+      --net)    net=full; shift ;;
+      --no-net) net=none; shift ;;
+      --hide)   hide+=("$2"); shift 2 ;;
+      --mem)    mem=$2; shift 2 ;;
+      --cpus)   cpus=$2; shift 2 ;;
+      --time)   time=$2; shift 2 ;;
+      --env)    envs+=("$2"); shift 2 ;;
+      --)       shift; break ;;
+      -*)       die "unknown option $1" ;;
+      *)        break ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "no command given"
+  need_root
+  id "$SBX_USER" >/dev/null 2>&1 || die "user $SBX_USER does not exist — run: sudo sandbox-run setup"
+  case "$dir" in */*|..|.|"") die "--dir must be a plain name" ;; esac
+  local work="$BASE/$dir"
+  mkdir -p "$work" && chown "$SBX_USER:$SBX_USER" "$work"
+
+  local -a props=(
+    -p User="$SBX_USER" -p Group="$SBX_USER"
+    -p ProtectHome=yes -p ProtectSystem=strict -p PrivateTmp=yes -p PrivateDevices=yes
+    -p NoNewPrivileges=yes -p RestrictSUIDSGID=yes -p LockPersonality=yes
+    -p ProtectKernelTunables=yes -p ProtectKernelModules=yes -p ProtectKernelLogs=yes
+    -p ProtectControlGroups=yes -p ProtectClock=yes -p ProtectHostname=yes
+    -p RestrictNamespaces=yes -p RestrictRealtime=yes
+    -p TemporaryFileSystem="$(dirname "$BASE"):ro" -p BindPaths="$work"
+    -p InaccessiblePaths=-/root -p InaccessiblePaths=-/var/lib -p InaccessiblePaths=-/mnt
+    -p InaccessiblePaths=-/media -p InaccessiblePaths=-/etc/ssh -p InaccessiblePaths=-/etc/shadow
+    -p MemoryMax="$mem" -p MemorySwapMax=0 -p CPUQuota="$((cpus * 100))%" -p TasksMax=1024
+    -p RuntimeMaxSec="$time"
+    -p WorkingDirectory="$work"
+  )
+  for h in "${hide[@]}"; do props+=(-p InaccessiblePaths="-$h"); done
+  case "$net" in
+    local) props+=(-p IPAddressDeny=any -p IPAddressAllow=localhost) ;;
+    none)  props+=(-p PrivateNetwork=yes) ;;
+    full)  ;;
+  esac
+  local -a envargs=(-E HOME="$work/.home" -E PATH=/usr/local/bin:/usr/bin:/bin -E LANG=C.UTF-8)
+  for e in "${envs[@]}"; do envargs+=(-E "$e"); done
+
+  exec systemd-run --pipe --wait --quiet --collect "${props[@]}" "${envargs[@]}" -- "$@"
+}
+
+cmd_check() {
+  need_root
+  id "$SBX_USER" >/dev/null 2>&1 || die "run: sudo sandbox-run setup"
+  local self; self=$(readlink -f "$0")
+  local pass=0 fail=0 home_probe
+  home_probe=$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6); home_probe=${home_probe:-/root}
+  sb() { "$self" --dir check "$@" </dev/null 2>&1 || true; }
+  t() { # name, expectation(ok|blocked), output
+    local name=$1 want=$2 out=$3 got=blocked
+    if [ "$want" = ok ]; then echo "$out" | grep -q "^SANDBOX-OK$" && got=ok || got=blocked
+    else echo "$out" | grep -q "^SANDBOX-OK$" && got=ok || got=blocked; fi
+    if [ "$got" = "$want" ]; then pass=$((pass + 1)); printf '  \e[32m✓\e[0m %-44s %s\n' "$name" "$want"
+    else fail=$((fail + 1)); printf '  \e[31m✗\e[0m %-44s expected %s, got %s\n' "$name" "$want" "$got"; fi
+  }
+  echo "sandbox-run $VERSION — escape tests (each runs inside the sandbox)"
+  t "runs as the unprivileged sandbox user"      ok      "$(sb sh -c "[ \"\$(id -un)\" = $SBX_USER ] && echo SANDBOX-OK")"
+  t "can write its own work directory"           ok      "$(sb sh -c 'echo x > probe && cat probe >/dev/null && echo SANDBOX-OK')"
+  t "cannot list your home ($home_probe)"        blocked "$(sb sh -c "ls '$home_probe' >/dev/null 2>&1 && echo SANDBOX-OK")"
+  t "cannot read /root"                          blocked "$(sb sh -c 'ls /root >/dev/null 2>&1 && echo SANDBOX-OK')"
+  t "cannot read /etc/shadow"                    blocked "$(sb sh -c 'cat /etc/shadow >/dev/null 2>&1 && echo SANDBOX-OK')"
+  t "cannot see /var/lib"                        blocked "$(sb sh -c 'ls /var/lib/* >/dev/null 2>&1 && echo SANDBOX-OK')"
+  t "cannot see sibling work dirs"               blocked "$(sb sh -c "ls '$(dirname "$BASE")' 2>/dev/null | grep -qv '^$(basename "$BASE")\$' && echo SANDBOX-OK")"
+  t "cannot write the OS (/etc, /usr)"           blocked "$(sb sh -c 'touch /etc/x 2>/dev/null || touch /usr/x 2>/dev/null; [ -e /etc/x ] || [ -e /usr/x ] && echo SANDBOX-OK')"
+  t "cannot use sudo"                            blocked "$(sb sh -c 'sudo -n true 2>/dev/null && echo SANDBOX-OK')"
+  t "cannot reach the internet (default)"        blocked "$(sb sh -c 'timeout 5 bash -c "exec 3<>/dev/tcp/1.1.1.1/443" 2>/dev/null && echo SANDBOX-OK')"
+  t "memory limit holds (asks for 2x --mem)"     blocked "$(sb --mem 64M sh -c 'python3 -c "b=bytearray(128*1024*1024)" 2>/dev/null && echo SANDBOX-OK')"
+  t "time limit holds"                           blocked "$(sb --time 2s sh -c 'sleep 5 && echo SANDBOX-OK')"
+  t "cannot see other sandboxes' work dirs"      blocked "$(sb sh -c "ls '$BASE' | grep -qv '^check\$' && echo SANDBOX-OK")"
+  echo "  controls — the same probes with the wall removed must succeed, or the tests above prove nothing:"
+  t "control: internet reachable with --net"     ok      "$(sb --net sh -c 'timeout 5 bash -c "exec 3<>/dev/tcp/1.1.1.1/443" 2>/dev/null && echo SANDBOX-OK')"
+  t "control: 128M fits under --mem 512M"        ok      "$(sb --mem 512M sh -c 'python3 -c "b=bytearray(128*1024*1024)" 2>/dev/null && echo SANDBOX-OK')"
+  t "control: sleep finishes under --time 30s"   ok      "$(sb --time 30s sh -c 'sleep 1 && echo SANDBOX-OK')"
+  echo; echo "$pass passed, $fail failed"
+  [ "$fail" -eq 0 ]
+}
+
+cmd_workdir() {
+  need_root
+  local dir=${1:-default}
+  case "$dir" in */*|..|.|"") die "work dir must be a plain name" ;; esac
+  mkdir -p "$BASE/$dir" && chown "$SBX_USER:$SBX_USER" "$BASE/$dir" && echo "$BASE/$dir"
+}
+
+case "${1:-}" in
+  setup) shift; cmd_setup "$@" ;;
+  workdir) shift; cmd_workdir "$@" ;;
+  check) shift; cmd_check "$@" ;;
+  --version|-V) echo "sandbox-run $VERSION" ;;
+  ""|-h|--help|help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) run_sandboxed "$@" ;;
+esac
